@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
 use proc_macro2::TokenStream;
-use quote::{quote, ToTokens, TokenStreamExt};
-use syn::Ident;
+use quote::{quote, ToTokens, TokenStreamExt, quote_spanned};
+use syn::{Ident, spanned::Spanned};
 
 use crate::ast::Fields;
 use crate::codegen::error::{ErrorCheck, ErrorDeclaration};
@@ -67,13 +67,58 @@ impl<'a> ToTokens for UnitMatchArm<'a> {
         }
 
         let name_in_attr = &val.name_in_attr;
+        let variant_ident = val.variant_ident;
+        let ty_ident = val.ty_ident;
 
         if val.data.is_unit() {
-            let variant_ident = val.variant_ident;
-            let ty_ident = val.ty_ident;
-
             tokens.append_all(quote!(
                 #name_in_attr => ::darling::export::Ok(#ty_ident::#variant_ident),
+            ));
+        } else if val.data.is_newtype() {
+            let field = val.data.fields.first().expect("newtype doesnt have field");
+            let ty = field.ty;
+            let from_none =
+                quote_spanned!(ty.span()=> <#ty as ::darling::FromMeta>::from_none());
+            let default_val = if let Some(ref expr) = field.default_expression {
+                quote!({
+                    ::darling::export::Ok(#ty_ident::#variant_ident(#expr))
+                })
+            } else {
+                quote!(match #from_none {
+                    ::darling::export::Some(__type_fallback) => {
+                        ::darling::export::Ok(#ty_ident::#variant_ident(__type_fallback))
+                    }
+                    ::darling::export::None => {
+                        ::darling::export::Err(::darling::Error::unsupported_format("literal"))
+                    }
+                })
+            };
+
+            tokens.append_all(quote!(
+                #name_in_attr => #default_val
+            ));
+        } else if val.data.is_struct() {
+            let vdg = FieldsGen::new(&val.data, val.allow_unknown_fields);
+            let decls = vdg.declarations();
+            let require_fields = vdg.require_fields();
+            let declare_errors = ErrorDeclaration::default();
+            let check_errors = ErrorCheck::with_location(name_in_attr);
+            let inits = vdg.initializers();
+
+            tokens.append_all(quote!(
+                #name_in_attr => {
+                    #declare_errors
+
+                    #decls
+
+                    #require_fields
+
+                    #check_errors
+
+                    ::darling::export::Ok(#ty_ident::#variant_ident {
+                        #inits
+                    })
+                }
             ));
         } else {
             tokens.append_all(quote!(
